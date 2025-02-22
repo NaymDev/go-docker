@@ -1,78 +1,205 @@
 package main
 
 import (
-	"context"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"os"
-	"os/signal"
-	"syscall"
-	"time"
+	"strings"
+	"sync"
 
-	"github.com/gorilla/mux"
-	"gopkg.in/natefinch/lumberjack.v2"
+	"github.com/miekg/dns"
 )
 
-func handler(w http.ResponseWriter, r *http.Request) {
-	query := r.URL.Query()
-	name := query.Get("name")
-	if name == "" {
-		name = "Guest"
+const (
+	redirectIPV4 = "192.168.0.40"            // For A records (IPv4)
+	redirectIPV6 = "2a02:8071:d81:340::7e2a" // For AAAA records (IPv6)
+)
+
+func handleARecord(msg *dns.Msg, q dns.Question) {
+	aRecord := dns.A{
+		Hdr: dns.RR_Header{
+			Name:   q.Name,
+			Rrtype: dns.TypeA,
+			Class:  dns.ClassINET,
+			Ttl:    600,
+		},
+		A: net.ParseIP(redirectIPV4),
 	}
-	log.Printf("Received request for %s\n", name)
-	w.Write([]byte(fmt.Sprintf("Hello, %s\n", name)))
+	msg.Answer = append(msg.Answer, &aRecord)
+}
+
+func handleAAAARecord(msg *dns.Msg, q dns.Question) {
+	aaaaRecord := dns.AAAA{
+		Hdr: dns.RR_Header{
+			Name:   q.Name,
+			Rrtype: dns.TypeAAAA,
+			Class:  dns.ClassINET,
+			Ttl:    600,
+		},
+		AAAA: net.ParseIP(redirectIPV6),
+	}
+	msg.Answer = append(msg.Answer, &aaaaRecord)
+}
+
+//////////////////////////////////////
+
+var (
+	AllowedDomains = make(map[string]bool)
+	RecentBlocked  = []string{}
+	mu             sync.RWMutex
+)
+
+func ExtractBaseDomain(inputURL string) string {
+	return inputURL
+}
+
+/*
+	func handleDNSRequest(w dns.ResponseWriter, r *dns.Msg) {
+		m := new(dns.Msg)
+		m.SetReply(r)
+		m.Authoritative = true
+
+		for _, q := range r.Question {
+			fmt.Printf("Received DNS query for %s 			[%s]\n", q.Name, dns.TypeToString[q.Qtype])
+
+			mu.RLock()
+			allowed := false // AllowedDomains[ExtractBaseDomain(q.Name)]
+			mu.RUnlock()
+
+			if allowed || (!strings.Contains(q.Name, "dbs") && !strings.Contains(q.Name, "apple_QWECCQEB") && !strings.Contains(q.Name, "bsweinheim") && !strings.Contains(q.Name, "jamfcloud")) {
+				c := new(dns.Client)
+				res, _, err := c.Exchange(r, "8.8.8.8:53")
+				if err != nil {
+					fmt.Printf("Error resolving DNS query: %s\n", err)
+					continue
+				}
+
+				for _, ans := range res.Answer {
+					m.Answer = append(m.Answer, ans)
+				}
+			} else {
+				mu.RLock()
+				RecentBlocked = append(RecentBlocked, q.Name)
+				if len(RecentBlocked) > 30 {
+					RecentBlocked = RecentBlocked[1:]
+				}
+				mu.RUnlock()
+				fmt.Printf("Disallow %s \n", q.Name)
+				m.SetRcode(r, dns.RcodeRefused)
+			}
+		}
+
+		w.WriteMsg(m)
+	}
+*/
+func handleDNSRequest(w dns.ResponseWriter, r *dns.Msg) {
+	msg := dns.Msg{}
+	msg.SetReply(r)
+	msg.Authoritative = true
+
+	// Handle each DNS question in the request
+	for _, q := range r.Question {
+		fmt.Printf("Received DNS query for %s 			[%s]\n", q.Name, dns.TypeToString[q.Qtype])
+		if strings.Contains(q.Name, "dbs") || strings.Contains(q.Name, "apple") || strings.Contains(q.Name, "bsweinheim") || strings.Contains(q.Name, "jamfcloud") {
+			c := new(dns.Client)
+			res, _, err := c.Exchange(r, "8.8.8.8:53")
+			if err != nil {
+				fmt.Printf("Error resolving DNS query: %s\n", err)
+				continue
+			}
+
+			for _, ans := range res.Answer {
+				msg.Answer = append(msg.Answer, ans)
+			}
+		} else {
+			switch q.Qtype {
+			case dns.TypeA:
+				handleARecord(&msg, q)
+			case dns.TypeAAAA:
+				handleAAAARecord(&msg, q)
+			default:
+				log.Printf("Unhandled DNS query type: %d\n", q.Qtype)
+			}
+		}
+	}
+
+	// Send the response back to the client
+	if err := w.WriteMsg(&msg); err != nil {
+		log.Printf("Failed to send DNS response: %s\n", err.Error())
+	}
+}
+
+func handleDNSControl(w http.ResponseWriter, r *http.Request) {
+	if r.Method == "POST" || r.Method == "GET" {
+		r.ParseForm()
+		baseDomain := r.Form.Get("base_domain")
+		action := r.Form.Get("action")
+		fmt.Printf("%s,%s\n", baseDomain, action)
+
+		mu.Lock()
+		defer mu.Unlock()
+		if action == "allow" {
+			AllowedDomains[baseDomain] = true
+			RecentBlocked = removeString(RecentBlocked, baseDomain)
+		} else if action == "disallow" {
+			delete(AllowedDomains, baseDomain)
+		}
+	}
+	//fmt.Println(AllowedDomains)
+	http.Redirect(w, r, "/control", http.StatusSeeOther)
+}
+
+func handleControlPanel(w http.ResponseWriter, r *http.Request) {
+	//fmt.Println("cp:", AllowedDomains)
+	mu.RLock()
+	defer mu.RUnlock()
+
+	fmt.Fprintf(w, "<h1>Allowed Base Domains</h1>")
+	fmt.Fprintf(w, "<ul>")
+	for domain := range AllowedDomains {
+		fmt.Fprintf(w, "<li>%s <a href=\"/controla?base_domain=%s&action=disallow\">Remove</a></li>", domain, domain)
+	}
+	fmt.Fprintf(w, "</ul>")
+
+	fmt.Fprintf(w, "<form method=\"post\" action=\"/controla\">")
+	fmt.Fprintf(w, "<input type=\"text\" name=\"base_domain\" placeholder=\"Enter base domain\">")
+	fmt.Fprintf(w, "<input type=\"submit\" name=\"action\" value=\"allow\">")
+	fmt.Fprintf(w, "</form>")
+	for _, domain := range RecentBlocked {
+		fmt.Fprintf(w, "<li>%s <a href=\"/controla?base_domain=%s&action=allow\">Allow</a></li>", domain, domain)
+	}
 }
 
 func main() {
-	// Create Server and Route Handlers
-	r := mux.NewRouter()
+	server := &dns.Server{Addr: ":53", Net: "udp"}
+	dns.HandleFunc(".", handleDNSRequest)
 
-	r.HandleFunc("/", handler)
+	http.HandleFunc("/control", handleControlPanel)
+	http.HandleFunc("/controla", handleDNSControl)
 
-	srv := &http.Server{
-		Handler:      r,
-		Addr:         ":8080",
-		ReadTimeout:  10 * time.Second,
-		WriteTimeout: 10 * time.Second,
-	}
-
-	// Configure Logging
-	LOG_FILE_LOCATION := os.Getenv("LOG_FILE_LOCATION")
-	if LOG_FILE_LOCATION != "" {
-		log.SetOutput(&lumberjack.Logger{
-			Filename:   LOG_FILE_LOCATION,
-			MaxSize:    500, // megabytes
-			MaxBackups: 3,
-			MaxAge:     28,   //days
-			Compress:   true, // disabled by default
-		})
-	}
-
-	// Start Server
+	fmt.Println("Control panel server listening on port 8080...")
 	go func() {
-		log.Println("Starting Server")
-		if err := srv.ListenAndServe(); err != nil {
-			log.Fatal(err)
+		if err := http.ListenAndServe(":8080", nil); err != nil {
+			fmt.Fprintf(os.Stderr, "Failed to start control panel server: %s\n", err)
+			os.Exit(1)
 		}
 	}()
 
-	// Graceful Shutdown
-	waitForShutdown(srv)
+	fmt.Println("DNS server listening on port 53...")
+	if err := server.ListenAndServe(); err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to start DNS server: %s\n", err)
+		os.Exit(1)
+	}
 }
 
-func waitForShutdown(srv *http.Server) {
-	interruptChan := make(chan os.Signal, 1)
-	signal.Notify(interruptChan, os.Interrupt, syscall.SIGINT, syscall.SIGTERM)
-
-	// Block until we receive our signal.
-	<-interruptChan
-
-	// Create a deadline to wait for.
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second*10)
-	defer cancel()
-	srv.Shutdown(ctx)
-
-	log.Println("Shutting down")
-	os.Exit(0)
+func removeString(slice []string, str string) []string {
+	var result []string
+	for _, s := range slice {
+		if s != str {
+			result = append(result, s)
+		}
+	}
+	return result
 }
